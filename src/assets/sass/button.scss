@@ -1,5 +1,9 @@
 .btn {
-	font-size: 1.1em;
+  display: flex;
+  align-items: center;
+  font-size: .9rem;
+  text-transform: uppercase;
+  font-family: 'roboto condensed';
 	padding: .4em .6em;
 	border: 0;
 	border-radius: 2px;
@@ -13,7 +17,12 @@
 	}
 
 	&.-small {
-		font-size: 1em;
+		font-size: .75rem;
+	}
+
+	&.-condensed {
+    padding: .2rem .3rem;
+		font-size: .75rem;
 	}
 
 	&.-red {
@@ -25,10 +34,10 @@
 	}
 
 	&.-dark {
-		background-color: $dark;
+		background-color: lighten($dark, 5%);
 	
 		&:hover {
-			background-color: lighten($dark, 10%);
+			background-color: $dark;
 		}
 	}
 }

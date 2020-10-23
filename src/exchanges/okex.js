@@ -6,35 +6,46 @@ class Okex extends Exchange {
     super(options)
 
     this.id = 'okex'
+    this.types = []
+
+    this.tradeStack = []
+    this.dispatchTradesTimeout = null
 
     this.endpoints = {
       PRODUCTS: [
         'https://www.okex.com/api/spot/v3/instruments',
         'https://www.okex.com/api/swap/v3/instruments',
-        'https://www.okex.com/api/futures/v3/instruments',
+        'https://www.okex.com/api/futures/v3/instruments'
       ],
-      TRADES: () => `https://www.okex.com/api/v1/trades.do?symbol=${this.pair}`,
+      TRADES: () => `https://www.okex.com/api/v1/trades.do?symbol=${this.pair}`
     }
 
-    this.matchPairName = (pair) => {
-      let id = this.products[pair] || this.products[pair.replace(/USDT/i, 'USD')];
+    // 2019-11-06
+    // retro compatibility for client without contract specification stored
+    // -> force refresh of stored instruments / specs
+    if (this.products && typeof this.specs === 'undefined') {
+      delete this.products
+    }
+
+    this.matchPairName = pair => {
+      let id = this.products[pair] || this.products[pair.replace(/USDT/i, 'USD')]
 
       if (!id) {
         for (let name in this.products) {
           if (pair === this.products[name]) {
             id = this.products[name]
-            break;
+            break
           }
         }
       }
 
       if (id) {
         if (/\d+$/.test(id)) {
-          this.type = 'futures';
-        } else if (/\-SWAP$/.test(id)) {
-          this.type = 'swap';
+          this.types[id] = 'futures'
+        } else if (/-SWAP$/.test(id)) {
+          this.types[id] = 'swap'
         } else {
-          this.type = 'spot';
+          this.types[id] = 'spot'
         }
       }
 
@@ -43,44 +54,55 @@ class Okex extends Exchange {
 
     this.options = Object.assign(
       {
-        url: 'wss://real.okex.com:10442/ws/v3',
+        url: 'wss://real.okex.com:8443/ws/v3'
       },
       this.options
     )
+
+    this.initialize()
   }
 
   connect() {
-    if (!super.connect()) return
+    const validation = super.connect()
+    if (!validation) return Promise.reject()
+    else if (validation instanceof Promise) return validation
 
-    this.api = new WebSocket(this.getUrl())
+    return new Promise((resolve, reject) => {
+      this.api = new WebSocket(this.getUrl())
 
-    this.api.binaryType = 'arraybuffer'
+      this.api.binaryType = 'arraybuffer'
 
-    this.api.onmessage = (event) =>
-      this.emitTrades(this.formatLiveTrades(event.data))
+      this.api.onmessage = event => this.queueTrades(this.formatLiveTrades(event.data))
 
-    this.api.onopen = (event) => {
-      this.api.send(
-        JSON.stringify({
-          op: 'subscribe',
-          args: [`${this.type}/trade:${this.pair}`],
-        })
-      )
+      this.api.onopen = e => {
+        this.api.send(
+          JSON.stringify({
+            op: 'subscribe',
+            args: this.pairs.map(pair => `${this.types[pair]}/trade:${pair}`)
+          })
+        )
 
-      this.keepalive = setInterval(() => {
-        this.api.send('ping')
-      }, 30000)
+        this.keepalive = setInterval(() => {
+          this.api.send('ping')
+        }, 30000)
 
-      this.emitOpen(event)
-    }
+        this.emitOpen(e)
 
-    this.api.onclose = (event) => {
-      this.emitClose(event)
+        resolve()
+      }
 
-      clearInterval(this.keepalive)
-    }
+      this.api.onclose = event => {
+        this.emitClose(event)
 
-    this.api.onerror = this.emitError.bind(this, { message: 'Websocket error' })
+        clearInterval(this.keepalive)
+      }
+
+      this.api.onerror = () => {
+        this.emitError({ message: `${this.id} disconnected` })
+
+        reject()
+      }
+    })
   }
 
   disconnect() {
@@ -111,21 +133,21 @@ class Okex extends Exchange {
     }
 
     return json.data.map(trade => {
-      let size;
+      let size
 
-      if (this.type === 'spot') {
-        size = trade.size
+      if (typeof this.specs[trade.instrument_id] !== 'undefined') {
+        size = ((trade.size || trade.qty) * this.specs[trade.instrument_id]) / trade.price
       } else {
-        size = (trade.size || trade.qty) * (/^BTC/.test(this.pair) ? 100 : 10) / trade.price
+        size = trade.size
       }
 
-      return [
-        this.id,
-        +new Date(trade.timestamp),
-        +trade.price,
-        size,
-        trade.side === 'buy' ? 1 : 0,
-      ]
+      return {
+        exchange: this.id,
+        timestamp: +new Date(trade.timestamp),
+        price: +trade.price,
+        size: +size,
+        side: trade.side
+      }
     })
   }
 
@@ -142,29 +164,38 @@ class Okex extends Exchange {
   } */
 
   formatProducts(response) {
-    const output = {}
+    const products = {}
+    const specs = {}
 
     const types = ['spot', 'swap', 'futures']
 
     response.forEach((data, index) => {
       data.forEach(product => {
-        const pair = ((product.base_currency ? product.base_currency : product.underlying_index) + product.quote_currency.replace(/usdt$/i, 'USD')).toUpperCase() // base+quote ex: BTCUSD
+        const pair = (
+          (product.base_currency ? product.base_currency : product.underlying_index) +
+          (types[index] === 'spot' ? product.quote_currency.replace(/usdt$/i, 'USD') : product.quote_currency)
+        ).toUpperCase() // base+quote ex: BTCUSD
 
         switch (types[index]) {
           case 'spot':
-            output[pair] = product.instrument_id
-          break
+            products[pair] = product.instrument_id
+            break
           case 'swap':
-            output[pair + '-SWAP'] = product.instrument_id
-          break
+            products[pair + '-SWAP'] = product.instrument_id
+            specs[product.instrument_id] = +product.contract_val
+            break
           case 'futures':
-            output[pair + '-' + product.alias.toUpperCase()] = product.instrument_id
-          break
+            products[pair + '-' + product.alias.toUpperCase()] = product.instrument_id
+            specs[product.instrument_id] = +product.contract_val
+            break
         }
       })
     })
 
-    return output
+    return {
+      products,
+      specs
+    }
   }
 
   pad(num, size) {
